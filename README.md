@@ -115,8 +115,11 @@
 - **gh 本地 tag 坑**：上游克隆自带同名本地 tag，`gh release create` 会报
   "tag exists locally but has not been pushed"；先 `git tag -d` 再带
   `--target main` 创建。
-- **资产重复上传坑**：`"$BIN_DIR"/*` 通配已包含 SHA256SUMS，不要再显式传入，
-  否则 422 `ReleaseAsset.name already exists`（gh 会自动回滚已建 release）。
+- **资产重复上传坑**：发布必须用 `find "$BIN_DIR" -maxdepth 1 -type f` 只传文件——
+  上游 build-binaries.sh 打包后会解压回目录做本地测试，`"$BIN_DIR"/*` 通配会把
+  目录也传上去导致 `read ...: is a directory` 错误（omp 项目产物全是文件所以
+  没有此问题）。SHA256SUMS 已包含在 find 结果里，不要再显式传入（否则 422
+  `ReleaseAsset.name already exists`）。
 
 **版本与 latest 维护**
 

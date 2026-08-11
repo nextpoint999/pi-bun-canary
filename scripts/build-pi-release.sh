@@ -174,7 +174,9 @@ if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
     gh release view "$RELEASE_TAG" --json assets -q '.assets[].name' | while read -r aname; do
       [ -n "$aname" ] && gh release delete-asset "$RELEASE_TAG" "$aname" --yes >/dev/null
     done
-    gh release upload "$RELEASE_TAG" "$BIN_DIR"/* --clobber
+    # 只上传文件（上游 build-binaries.sh 会留下解压目录，通配符 * 会把目录
+    # 也传上去导致 "is a directory" 错误）
+    gh release upload "$RELEASE_TAG" $(find "$BIN_DIR" -maxdepth 1 -type f) --clobber
     gh release edit "$RELEASE_TAG" --notes "$RELEASE_NOTES"
     echo "已更新: https://github.com/${GITHUB_REPOSITORY:-<your-repo>}/releases/tag/${RELEASE_TAG}"
     exit 0
@@ -183,8 +185,8 @@ if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
   exit 0
 fi
 DEFAULT_BRANCH="$(gh repo view --json defaultBranchRef -q '.defaultBranchRef.name' 2>/dev/null || echo main)"
-# 注意: "$BIN_DIR"/* 已包含 SHA256SUMS，不能重复显式传入（否则 422 already exists）
-gh release create "$RELEASE_TAG" "$BIN_DIR"/* \
+# 只上传文件：SHA256SUMS 已包含在 find 结果里，不能重复显式传入（否则 422）
+gh release create "$RELEASE_TAG" $(find "$BIN_DIR" -maxdepth 1 -type f) \
   --target "$DEFAULT_BRANCH" \
   --title "${TAG}" \
   --notes "$RELEASE_NOTES"
