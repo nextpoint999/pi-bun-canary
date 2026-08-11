@@ -1,0 +1,179 @@
+# =============================================================================
+# pi 镜像发布 workflow
+#
+# 定时(每 2 小时)检查上游 earendil-works/pi 的 release；有新版就用该 tag 源码 +
+# 最新 bun canary 构建全部 6 个平台二进制，发布到本仓库
+# （发布 tag 与上游保持一致，如 v0.84.1）。
+#
+# 说明:
+#   * 自动/定时只镜像【上游最新版】（per_page=1）；历史/指定版本需手动
+#     dispatch 指定 tag（可配合 force 强制重建）
+#   * 每 2h 定时还会对比 bun canary revision 与最新 release body 中的
+#     revision——canary 前进时自动强制重建最新版（无需手动 force）
+#   * 构建复用上游官方 scripts/build-binaries.sh（npm ci + 跨平台原生绑定 +
+#     bun build --compile 6 平台），运行时从 bun canary tag 注入并经两级
+#     完整性校验（详见 scripts/build-pi-release.sh 头注释）
+#   * 本仓库需开启 Actions；发布用的 GITHUB_TOKEN 自动授权（contents: write）
+#   * 安全: 用户输入（tag/targets）一律经 env 传递，禁止插值进 run: 脚本
+# =============================================================================
+name: Mirror pi releases
+
+on:
+  schedule:
+    # UTC 每 2 小时（GitHub cron 使用 UTC）；最新版已镜像但 bun canary 前进时自动强制重建
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "可选：指定上游 tag 强制构建（如 v0.84.1）"
+        required: false
+        type: string
+      latest:
+        description: "手动构建后 latest 徽标处理：auto=按上游最新版本(默认)；set=将本次构建版本设为 latest；keep=不修改（注意: 不能用 yes/no，YAML 会解析为布尔值）"
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - set
+          - keep
+      force:
+        description: "强制重建：即使该 tag 已发布也重新构建，并替换已有 release 的全部资产（用于更新到最新 bun canary）"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pi-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: 检测并镜像 pi release
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        # 固定 SHA（v7.0.1，node24 运行时，Node 20 已弃用）防供应链篡改；升级时更新 SHA 与注释
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: 安装 bun canary
+        # 固定 SHA（= oven-sh/setup-bun@v2），防供应链篡改；升级时同步更新
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: canary
+
+      - name: 安装 Node.js（npm 构建依赖）
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: 计算待镜像的上游版本
+        id: versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_INPUT: ${{ inputs.tag }}
+          FORCE_INPUT: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          UPSTREAM="earendil-works/pi"
+          if [ -n "${TAG_INPUT}" ]; then
+            TAGS="${TAG_INPUT}"
+            SKIP_MIRRORED="false"   # 手动指定 tag：允许 force 强制重建
+          else
+            # 只取上游最新一个 release（per_page=1，含预发布）
+            TAGS="$(gh api "repos/${UPSTREAM}/releases?per_page=1" --jq '.[].tag_name')"
+            SKIP_MIRRORED="true"    # 自动/定时：只更新最新版，不补历史
+          fi
+          # 本仓库已发布的版本（发布 tag 与上游同名，如 v0.84.1）
+          MIRRORED="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --paginate --jq '.[].tag_name' 2>/dev/null || true)"
+          NEW=""
+          for t in $TAGS; do
+            # -F: 固定字符串匹配（tag 中的 . + 是正则元字符，不能当正则用）
+            if printf '%s\n' "$MIRRORED" | grep -Fqx "${t}"; then
+              if [ "${FORCE_INPUT:-false}" = "true" ] && [ "$SKIP_MIRRORED" = "false" ]; then
+                echo "已镜像: ${t}，但 force=true 强制重建（更新到最新 canary）"
+                NEW="$NEW $t"
+              else
+                echo "已镜像: ${t}，跳过（更旧的版本不再补发，仅手动指定时构建）"
+                # 上游按最新优先排列，遇到第一个已镜像版本即停止——不补历史
+                [ "$SKIP_MIRRORED" = "true" ] && break
+              fi
+            else
+              NEW="$NEW $t"
+            fi
+          done
+          # 每轮最多处理 10 个新版本；遗漏的由后续轮询补齐
+          # 注意: 必须用 paste 合并成单行——多行值写入 GITHUB_OUTPUT 会触发
+          # "Invalid format" 报错（第二行没有 key= 前缀）。
+          NEW="$(echo "$NEW" | tr ' ' '\n' | sed '/^$/d' | head -10 | paste -sd' ' -)"
+
+          # 自动 force：最新版已镜像时，若 bun canary 已前进则强制重建
+          FORCE_NEEDED="false"
+          if [ -z "$NEW" ] && [ -n "$TAGS" ] && [ "$SKIP_MIRRORED" = "true" ]; then
+            LATEST_TAG="$(echo "$TAGS" | head -1)"
+            CUR_REV="$(bun --revision 2>/dev/null | grep -o '+[a-f0-9]\{9\}' | head -1 || true)"
+            LAST_REV="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=1" --jq '.[0].body' 2>/dev/null | grep -o '+[a-f0-9]\{9\}' | head -1 || true)"
+            if [ -n "$CUR_REV" ] && [ -n "$LAST_REV" ] && [ "$CUR_REV" != "$LAST_REV" ]; then
+              NEW="$LATEST_TAG"
+              FORCE_NEEDED="true"
+              echo "canary 已前进: ${LAST_REV} → ${CUR_REV}，强制重建 ${LATEST_TAG}"
+            else
+              echo "canary 无变化 (${CUR_REV:-无})，跳过"
+            fi
+          fi
+          if [ -z "$NEW" ]; then
+            echo "没有新的上游版本需要构建"
+          fi
+          echo "new_tags=${NEW}" >> "$GITHUB_OUTPUT"
+          echo "force_needed=${FORCE_NEEDED}" >> "$GITHUB_OUTPUT"
+
+      - name: 构建并发布新版本
+        if: ${{ steps.versions.outputs.new_tags != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_TAGS: ${{ steps.versions.outputs.new_tags }}
+          LATEST_INPUT: ${{ inputs.latest }}
+          FORCE_INPUT: ${{ inputs.force }}
+          FORCE_NEEDED: ${{ steps.versions.outputs.force_needed }}
+          UPSTREAM: earendil-works/pi
+        run: |
+          set -euo pipefail
+          # 手动 force 或自动检测到 canary 前进 → 强制重建
+          FORCE_FLAG="false"
+          [ "${FORCE_INPUT:-false}" = "true" ] && FORCE_FLAG="true"
+          [ "${FORCE_NEEDED:-false}" = "true" ] && FORCE_FLAG="true"
+          # 按版本升序构建（最新版最后发布 → 自然成为 latest；避免旧版本
+          # 后发布抢走 latest 徽标——GitHub 默认按发布时间而非版本号定 latest）
+          for tag in $(echo "$NEW_TAGS" | tr ' ' '\n' | sort -V); do
+            echo "===== 构建上游 ${tag} ====="
+            bash scripts/build-pi-release.sh "$tag" "$FORCE_FLAG"
+          done
+          # --- latest 徽标处理（make_latest=true 显式指定，覆盖日期误判） ---
+          LATEST_MODE="${LATEST_INPUT:-auto}"
+          if [ "$LATEST_MODE" = "keep" ]; then
+            echo "latest=keep，不修改 latest 徽标"
+          elif [ "$LATEST_MODE" = "set" ]; then
+            # 手动构建：将本次构建的最新版本设为 latest（如强制历史版本上位）
+            TARGET_TAG="$(echo "$NEW_TAGS" | tr ' ' '\n' | head -1)"
+            RID="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TARGET_TAG}" --jq '.id' 2>/dev/null || true)"
+            if [ -n "$RID" ]; then
+              gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${RID}" -f make_latest=true >/dev/null \
+                && echo "已将 ${TARGET_TAG} 设为 latest" \
+                || echo "[warn] make_latest 设置失败（预发布版本无法设为 latest，属预期）"
+            fi
+          else
+            # auto（默认）：把"上游最新版本"的镜像 release 设为 latest
+            NEWEST="$(gh api "repos/${UPSTREAM}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
+            if [ -n "$NEWEST" ]; then
+              RID="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${NEWEST}" --jq '.id' 2>/dev/null || true)"
+              if [ -n "$RID" ]; then
+                gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${RID}" -f make_latest=true >/dev/null \
+                  && echo "已将 ${NEWEST} 设为 latest" \
+                  || echo "[warn] make_latest 设置失败（预发布版本无法设为 latest，属预期）"
+              fi
+            fi
+          fi
