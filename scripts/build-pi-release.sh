@@ -169,9 +169,9 @@ RELEASE_NOTES="**上游**: [${UPSTREAM_REPO} ${TAG}](https://github.com/${UPSTRE
 **平台**: ${TARGETS}
 使用 bun canary 交叉编译的全平台镜像构建，附 SHA256 校验和。"
 # gh release view 偶发 HTTP 500（GitHub 服务端瞬时故障，实测 2026-08-14 omp 遇过：
-# 构建全部成功但 view 500 直接 exit 1 导致镜像中断），重试 3 次再决定
+# 构建全部成功但 view 500 直接 exit 1 导致镜像中断），重试 10 次再决定
 RELEASE_EXISTS=""
-for _try in 1 2 3; do
+for _try in 1 2 3 4 5 6 7 8 9 10; do
   if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
     RELEASE_EXISTS="yes"
     break
@@ -197,9 +197,9 @@ if [ -n "$RELEASE_EXISTS" ]; then
 fi
 DEFAULT_BRANCH="$(gh repo view --json defaultBranchRef -q '.defaultBranchRef.name' 2>/dev/null || echo main)"
 # 只上传文件：SHA256SUMS 已包含在 find 结果里，不能重复显式传入（否则 422）
-# create 同样可能偶发 500，失败重试 3 次（成功即 break）
+# create 同样可能偶发 500，失败重试 10 次（成功即 break）
 CREATED=""
-for _try in 1 2 3; do
+for _try in 1 2 3 4 5 6 7 8 9 10; do
   if gh release create "$RELEASE_TAG" $(find "$BIN_DIR" -maxdepth 1 -type f) \
     --target "$DEFAULT_BRANCH" \
     --title "${TAG}" \
@@ -210,7 +210,7 @@ for _try in 1 2 3; do
   echo "[warn] gh release create ${RELEASE_TAG} 失败（第 ${_try} 次），10s 后重试"
   sleep 10
 done
-[ -n "$CREATED" ] || { echo "[error] gh release create 重试 3 次仍失败"; exit 1; }
+[ -n "$CREATED" ] || { echo "[error] gh release create 重试 10 次仍失败"; exit 1; }
 # 若上游是预发布（tag 含 -），标记为 prerelease
 if [[ "$TAG" == *-* ]]; then
   gh release edit "$RELEASE_TAG" --prerelease >/dev/null 2>&1 || true
