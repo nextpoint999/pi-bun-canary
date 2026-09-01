@@ -112,7 +112,7 @@ for entry in "${RUN_ENTRIES[@]}"; do
   if [ -n "$expected" ] && [ "$expected" = "$actual" ]; then
     echo "  [Tier1] ${asset} sha256 校验通过 (${actual:0:12})"
   else
-    if grep -a -q "1.4.0-canary" "$rtbin" 2>/dev/null; then
+    if grep -a -q "${BUN_VERSION}-canary" "$rtbin" 2>/dev/null; then
       echo "  [warn][Tier2] ${asset} 未通过 shas.txt 比对（bun 的 shas 滞后: 期望 ${expected:-无} ≠ 实际 ${actual:0:12}），已校验内嵌版本串为 canary，继续"
     else
       echo "[error] ${asset} 完整性校验失败（shas 不匹配且非 canary 运行时）"
